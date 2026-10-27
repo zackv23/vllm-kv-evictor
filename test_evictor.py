@@ -1,9 +1,14 @@
 import os
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 import evictor
+
+boto3 = pytest.importorskip("boto3")
+moto = pytest.importorskip("moto")
+from moto import mock_aws
 
 
 def _make_block(rank_dir, name, content=b"x", age_seconds=0):
@@ -145,3 +150,101 @@ def test_detect_atime_support_on_a_normal_tmp_mount(tmp_path):
     # containers; this is a real, not mocked, filesystem check.
     result = evictor.detect_atime_support(tmp_path)
     assert isinstance(result, bool)
+
+
+# ─────────────────────────────────────────────
+# S3Backend — vLLM's object-store secondary tier (moto-mocked, no real AWS)
+# ─────────────────────────────────────────────
+@pytest.fixture
+def s3_bucket():
+    with mock_aws():
+        client = boto3.client("s3", region_name="us-east-1")
+        client.create_bucket(Bucket="kvcache-test")
+        yield client, "kvcache-test"
+
+
+def _put_s3_object(client, bucket, key, body=b"x", age_days=0):
+    client.put_object(Bucket=bucket, Key=key, Body=body)
+    if age_days:
+        # moto's in-memory backend lets us directly backdate LastModified by
+        # reaching into the mocked object store rather than sleeping real time.
+        from moto.s3.models import s3_backends
+        backend = s3_backends["123456789012"]["aws"]
+        key_obj = backend.buckets[bucket].keys.get(key)
+        if key_obj is not None:
+            key_obj.last_modified = datetime.now(timezone.utc) - timedelta(days=age_days)
+
+
+def test_s3_backend_scan_lists_objects_with_last_modified_as_recency(s3_bucket):
+    client, bucket = s3_bucket
+    _put_s3_object(client, bucket, "blocks/a", b"aaaa")
+    backend = evictor.S3Backend(bucket)
+    blocks = backend.scan()
+    assert len(blocks) == 1
+    assert blocks[0].path == "blocks/a"
+    assert blocks[0].size == 4
+    assert blocks[0].atime == blocks[0].mtime  # S3 only has one timestamp -- write time
+
+
+def test_s3_backend_respects_prefix_filter(s3_bucket):
+    client, bucket = s3_bucket
+    _put_s3_object(client, bucket, "kv/a", b"x")
+    _put_s3_object(client, bucket, "other/b", b"yy")
+    backend = evictor.S3Backend(bucket, prefix="kv/")
+    blocks = backend.scan()
+    assert [b.path for b in blocks] == ["kv/a"]
+
+
+def test_s3_backend_detect_recency_mode_is_always_mtime(s3_bucket):
+    client, bucket = s3_bucket
+    backend = evictor.S3Backend(bucket)
+    assert backend.detect_recency_mode() == "mtime"  # no probe can change this -- S3 has no atime
+
+
+def test_s3_backend_delete_dry_run_does_not_delete(s3_bucket):
+    client, bucket = s3_bucket
+    _put_s3_object(client, bucket, "a", b"1234")
+    backend = evictor.S3Backend(bucket)
+    blocks = backend.scan()
+    freed, errors = backend.delete(blocks, dry_run=True)
+    assert freed == 4
+    assert errors == []
+    assert len(backend.scan()) == 1  # still there
+
+
+def test_s3_backend_delete_removes_objects_and_sums_freed_bytes(s3_bucket):
+    client, bucket = s3_bucket
+    _put_s3_object(client, bucket, "a", b"1234")
+    _put_s3_object(client, bucket, "b", b"56")
+    backend = evictor.S3Backend(bucket)
+    blocks = backend.scan()
+    freed, errors = backend.delete(blocks, dry_run=False)
+    assert freed == 6
+    assert errors == []
+    assert backend.scan() == []
+
+
+def test_s3_backend_delete_chunks_over_1000_keys(s3_bucket):
+    client, bucket = s3_bucket
+    n = 1500
+    for i in range(n):
+        _put_s3_object(client, bucket, f"blk/{i}", b"x")
+    backend = evictor.S3Backend(bucket, prefix="blk/")
+    blocks = backend.scan()
+    assert len(blocks) == n
+    freed, errors = backend.delete(blocks, dry_run=False)
+    assert freed == n
+    assert errors == []
+    assert backend.scan() == []
+
+
+def test_run_once_backend_end_to_end_with_s3(s3_bucket):
+    client, bucket = s3_bucket
+    _put_s3_object(client, bucket, "old", b"x" * 50, age_days=10)
+    _put_s3_object(client, bucket, "new", b"x" * 50, age_days=0)
+    backend = evictor.S3Backend(bucket)
+    result = evictor.run_once_backend(backend, capacity_bytes=60, low_water_bytes=50,
+                                       min_age_seconds=0, recency="mtime", dry_run=False)
+    assert result["evicted_files"] == 1
+    remaining = {b.path for b in backend.scan()}
+    assert remaining == {"new"}  # "old" (write time 10 days ago) evicted, "new" kept

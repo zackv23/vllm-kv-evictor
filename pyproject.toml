@@ -4,11 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-kv-evictor"
-version = "0.1.0"
-description = "Size-bounded eviction for vLLM's filesystem KV-cache offload tier"
+version = "0.2.0"
+description = "Size-bounded eviction for vLLM's filesystem and object-store KV-cache offload tiers"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.9"
+
+[project.optional-dependencies]
+s3 = ["boto3>=1.34"]
+test = ["pytest>=7", "boto3>=1.34", "moto[s3]>=5"]
 
 [project.scripts]
 vllm-kv-evictor = "evictor:main"
