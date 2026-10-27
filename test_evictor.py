@@ -1,0 +1,147 @@
+import os
+import time
+
+import pytest
+
+import evictor
+
+
+def _make_block(rank_dir, name, content=b"x", age_seconds=0):
+    p = rank_dir / name
+    p.write_bytes(content)
+    t = time.time() - age_seconds
+    os.utime(p, (t, t))
+    return p
+
+
+def test_scan_blocks_finds_files_under_rank_dirs_only(tmp_path):
+    r0 = tmp_path / "_r0"
+    r0.mkdir()
+    _make_block(r0, "a.blk", b"aaaa")
+    other = tmp_path / "not_a_rank_dir"
+    other.mkdir()
+    (other / "ignored.blk").write_bytes(b"zz")
+
+    blocks = evictor.scan_blocks(tmp_path)
+    assert len(blocks) == 1
+    assert blocks[0].path.name == "a.blk"
+    assert blocks[0].size == 4
+
+
+def test_scan_blocks_recurses_into_subdirectories(tmp_path):
+    r0 = tmp_path / "_r0"
+    (r0 / "nested").mkdir(parents=True)
+    _make_block(r0 / "nested", "b.blk", b"yy")
+    blocks = evictor.scan_blocks(tmp_path)
+    assert len(blocks) == 1
+
+
+def test_plan_eviction_under_capacity_evicts_nothing():
+    blocks = [evictor.Block(path="a", size=10, atime=0, mtime=0)]
+    assert evictor.plan_eviction(blocks, capacity_bytes=100, low_water_bytes=90,
+                                  min_age_seconds=0, now=1000) == []
+
+
+def test_plan_eviction_stops_at_low_water_mark():
+    now = 10_000
+    old = evictor.Block(path="old", size=40, atime=1, mtime=1)
+    mid = evictor.Block(path="mid", size=40, atime=500, mtime=500)
+    new = evictor.Block(path="new", size=40, atime=9000, mtime=9000)
+    plan = evictor.plan_eviction([old, mid, new], capacity_bytes=100, low_water_bytes=50,
+                                  min_age_seconds=0, now=now)
+    # total=120 > capacity=100 -> evict oldest-first until total <= low_water=50
+    # evict "old" (120->80, still >50) then "mid" (80->40, <=50) -> stop. "new" survives.
+    assert [b.path for b in plan] == ["old", "mid"]
+
+
+def test_plan_eviction_respects_min_age_grace_period():
+    now = 10_000
+    recent = evictor.Block(path="recent", size=100, atime=now - 5, mtime=now - 5)
+    plan = evictor.plan_eviction([recent], capacity_bytes=10, low_water_bytes=5,
+                                  min_age_seconds=60, now=now)
+    assert plan == []  # over capacity, but too young to touch
+
+
+def test_plan_eviction_uses_mtime_when_recency_is_mtime():
+    now = 10_000
+    # atime says "new" is oldest, mtime says "new" is newest -- recency="mtime" must follow mtime
+    a = evictor.Block(path="a", size=60, atime=9000, mtime=1)
+    b = evictor.Block(path="b", size=60, atime=1, mtime=9000)
+    plan = evictor.plan_eviction([a, b], capacity_bytes=100, low_water_bytes=65,
+                                  min_age_seconds=0, now=now, recency="mtime")
+    assert [x.path for x in plan] == ["a"]  # a has the oldest mtime; evicting it (120->60) clears low_water=65
+
+
+def test_evict_dry_run_reports_without_deleting(tmp_path):
+    p = tmp_path / "f.blk"
+    p.write_bytes(b"1234")
+    block = evictor.Block(path=p, size=4, atime=0, mtime=0)
+    freed, errors = evictor.evict([block], dry_run=True)
+    assert freed == 4
+    assert errors == []
+    assert p.exists()
+
+
+def test_evict_real_deletes_and_frees_bytes(tmp_path):
+    p = tmp_path / "f.blk"
+    p.write_bytes(b"1234")
+    block = evictor.Block(path=p, size=4, atime=0, mtime=0)
+    freed, errors = evictor.evict([block], dry_run=False)
+    assert freed == 4
+    assert errors == []
+    assert not p.exists()
+
+
+def test_evict_missing_file_reports_error_not_crash(tmp_path):
+    p = tmp_path / "missing.blk"
+    block = evictor.Block(path=p, size=4, atime=0, mtime=0)
+    freed, errors = evictor.evict([block], dry_run=False)
+    assert freed == 0
+    assert len(errors) == 1
+
+
+def test_run_once_end_to_end_dry_run(tmp_path):
+    r0 = tmp_path / "_r0"
+    r0.mkdir()
+    _make_block(r0, "old.blk", b"x" * 50, age_seconds=1000)
+    _make_block(r0, "new.blk", b"x" * 50, age_seconds=0)
+    result = evictor.run_once(tmp_path, capacity_bytes=60, low_water_bytes=50,
+                               min_age_seconds=0, recency="atime", dry_run=True)
+    assert result["scanned_files"] == 2
+    assert result["total_bytes_before"] == 100
+    assert result["evicted_files"] == 1
+    assert result["bytes_freed"] == 50
+    assert (r0 / "old.blk").exists()  # dry run: nothing actually deleted
+    assert (r0 / "new.blk").exists()
+
+
+def test_run_once_end_to_end_real_eviction(tmp_path):
+    r0 = tmp_path / "_r0"
+    r0.mkdir()
+    _make_block(r0, "old.blk", b"x" * 50, age_seconds=1000)
+    _make_block(r0, "new.blk", b"x" * 50, age_seconds=0)
+    result = evictor.run_once(tmp_path, capacity_bytes=60, low_water_bytes=50,
+                               min_age_seconds=0, recency="atime", dry_run=False)
+    assert result["evicted_files"] == 1
+    assert not (r0 / "old.blk").exists()
+    assert (r0 / "new.blk").exists()
+
+
+def test_parse_size_variants():
+    assert evictor.parse_size("500") == 500
+    assert evictor.parse_size("1KB") == 1000
+    assert evictor.parse_size("1KiB") == 1024
+    assert evictor.parse_size("2.5GB") == int(2.5 * 1000**3)
+    assert evictor.parse_size("1TiB") == 1024**4
+
+
+def test_parse_size_rejects_garbage():
+    with pytest.raises(Exception):
+        evictor.parse_size("not-a-size")
+
+
+def test_detect_atime_support_on_a_normal_tmp_mount(tmp_path):
+    # tmp_path is almost always on a normal (non-noatime) filesystem in CI/dev
+    # containers; this is a real, not mocked, filesystem check.
+    result = evictor.detect_atime_support(tmp_path)
+    assert isinstance(result, bool)
